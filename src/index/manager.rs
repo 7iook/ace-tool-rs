@@ -10,7 +10,8 @@ use anyhow::{anyhow, Result};
 use bincode::Options;
 use encoding_rs::{GB18030, GBK, UTF_8, WINDOWS_1252};
 use futures::stream::{FuturesUnordered, StreamExt};
-use ignore::gitignore::{Gitignore, GitignoreBuilder};
+use ignore::gitignore::Gitignore;
+use ignore::WalkBuilder;
 use rayon::prelude::*;
 use regex::Regex;
 use reqwest::Client;
@@ -18,7 +19,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{error, info, warn};
 use uuid::Uuid;
-use walkdir::WalkDir;
 
 use crate::config::Config;
 use crate::http_logger::{self, HttpRequestLog, HttpResponseLog};
@@ -270,10 +270,6 @@ impl IndexManager {
     /// Get the config hash
     pub fn config_hash(&self) -> &str {
         &self.config_hash
-    }
-
-    fn load_ignore_patterns(&self) -> Option<Gitignore> {
-        build_ignore_rules(&self.project_root)
     }
 
     /// Check if a path should be excluded
@@ -541,17 +537,25 @@ impl IndexManager {
     }
 
     /// Collect all text files
+    ///
+    /// Uses `ignore::WalkBuilder` (the same walker ripgrep uses) which automatically
+    /// honors *every* `.gitignore` up the directory tree AND in every subdirectory,
+    /// plus global git ignore (`~/.config/git/ignore` / `core.excludesfile`), the
+    /// per-repo `.git/info/exclude`, hidden files, and any custom ignore files we add
+    /// (`.aceignore`). This fixes the bug where subdirectory `.gitignore` rules were
+    /// silently dropped (e.g. `feige-copilot/.gitignore` containing `.chrome-data/`).
     pub fn collect_files(&self) -> Result<Vec<Blob>> {
         let mut blobs = Vec::new();
-        let gitignore = self.load_ignore_patterns();
 
-        for entry in WalkDir::new(&self.project_root)
+        let walker = WalkBuilder::new(&self.project_root)
             .follow_links(false)
-            .into_iter()
-            .filter_entry(|e| {
-                !self.should_exclude(e.path(), e.file_type().is_dir(), gitignore.as_ref())
-            })
-        {
+            .standard_filters(true) // gitignore hierarchy + global + .git/info/exclude + hidden
+            .parents(true)          // also honor .gitignore in ancestor dirs
+            .require_git(false)     // apply gitignore rules even if not inside a git repo
+            .add_custom_ignore_filename(".aceignore")
+            .build();
+
+        for entry in walker {
             let entry = match entry {
                 Ok(e) => e,
                 Err(e) => {
@@ -560,11 +564,20 @@ impl IndexManager {
                 }
             };
 
-            if !entry.file_type().is_file() {
+            let file_type = match entry.file_type() {
+                Some(ft) => ft,
+                None => continue,
+            };
+            if !file_type.is_file() {
                 continue;
             }
 
             let path = entry.path();
+
+            // Custom regex/glob patterns from --exclude etc. (still respected on top of gitignore)
+            if self.should_exclude(path, false, None) {
+                continue;
+            }
 
             // Check if file should be included based on extension or filename
             let filename = path
@@ -1598,63 +1611,50 @@ fn split_file_content_standalone(
     blobs
 }
 
-fn build_ignore_rules(project_root: &Path) -> Option<Gitignore> {
-    let ignore_files = [".gitignore", ".aceignore"];
-    let paths: Vec<_> = ignore_files
-        .iter()
-        .map(|f| project_root.join(f))
-        .filter(|p| p.exists())
-        .collect();
-
-    if paths.is_empty() {
-        return None;
-    }
-
-    let mut builder = GitignoreBuilder::new(project_root);
-    for path in &paths {
-        if let Some(err) = builder.add(path) {
-            warn!(
-                "Error parsing {} (continuing with valid patterns): {}",
-                path.file_name().unwrap_or_default().to_string_lossy(),
-                err
-            );
-        }
-    }
-    match builder.build() {
-        Ok(gi) => Some(gi),
-        Err(err) => {
-            warn!("Failed to build ignore rules: {}", err);
-            None
-        }
-    }
-}
-
 /// Standalone file path collection for use in spawn_blocking
+///
+/// Mirror of `IndexManager::collect_files` walking strategy: uses `ignore::WalkBuilder`
+/// so subdirectory `.gitignore` files, global git ignore, `.git/info/exclude` and
+/// `.aceignore` are all honored automatically. Custom `--exclude` regex patterns are
+/// applied on top via `should_exclude_standalone`.
 fn collect_file_paths_standalone(
     project_root: &Path,
     text_extensions: &HashSet<String>,
     text_filenames: &HashSet<String>,
     compiled_patterns: &[(String, Option<Regex>)],
 ) -> Vec<PathBuf> {
-    let gitignore = build_ignore_rules(project_root);
-
-    WalkDir::new(project_root)
+    let walker = WalkBuilder::new(project_root)
         .follow_links(false)
-        .into_iter()
-        .filter_entry(|e| {
-            !should_exclude_standalone(
-                e.path(),
-                e.file_type().is_dir(),
-                project_root,
-                gitignore.as_ref(),
-                compiled_patterns,
-            )
-        })
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-        .filter(|e| is_indexable_file_standalone(e.path(), text_extensions, text_filenames))
-        .map(|e| e.into_path())
-        .collect()
+        .standard_filters(true)
+        .parents(true)
+        .require_git(false)
+        .add_custom_ignore_filename(".aceignore")
+        .build();
+
+    let mut paths = Vec::new();
+    for entry in walker {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let file_type = match entry.file_type() {
+            Some(ft) => ft,
+            None => continue,
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        // Custom regex patterns still apply on top of gitignore
+        if should_exclude_standalone(path, false, project_root, None, compiled_patterns) {
+            continue;
+        }
+        if !is_indexable_file_standalone(path, text_extensions, text_filenames) {
+            continue;
+        }
+        paths.push(entry.into_path());
+    }
+    paths
 }
 
 /// Standalone exclude check for use in spawn_blocking
