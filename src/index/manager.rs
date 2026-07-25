@@ -136,6 +136,11 @@ struct BatchUploadRequest {
 #[derive(Debug, Deserialize)]
 struct BatchUploadResponse {
     blob_names: Vec<String>,
+    /// Blobs the server accepted the request for but refused to index (e.g. empty content).
+    /// Previously absent from this struct, so serde dropped it silently -- which is what made
+    /// the resulting `400 unknown blobs` on retrieval so hard to trace back to its cause.
+    #[serde(default)]
+    skipped_blobs: Vec<String>,
 }
 
 /// Result of a single batch upload attempt
@@ -550,8 +555,8 @@ impl IndexManager {
         let walker = WalkBuilder::new(&self.project_root)
             .follow_links(false)
             .standard_filters(true) // gitignore hierarchy + global + .git/info/exclude + hidden
-            .parents(true)          // also honor .gitignore in ancestor dirs
-            .require_git(false)     // apply gitignore rules even if not inside a git repo
+            .parents(true) // also honor .gitignore in ancestor dirs
+            .require_git(false) // apply gitignore rules even if not inside a git repo
             .add_custom_ignore_filename(".aceignore")
             .build();
 
@@ -613,6 +618,12 @@ impl IndexManager {
                         );
                         continue;
                     }
+                    // Skip empty files: the server puts empty blobs in `skipped_blobs` and
+                    // never indexes them, so keeping them would break retrieval with
+                    // `400 unknown blobs` (see process_file for the full rationale).
+                    if metadata.len() == 0 {
+                        continue;
+                    }
                 }
                 Err(e) => {
                     warn!("Failed to get metadata for {:?}: {}, skipping", path, e);
@@ -636,6 +647,11 @@ impl IndexManager {
 
             // Sanitize content
             let clean_content = Self::sanitize_content(&content);
+
+            // Whitespace-only files carry nothing retrievable either.
+            if clean_content.trim().is_empty() {
+                continue;
+            }
 
             // Skip too large files
             if clean_content.len() > MAX_BLOB_SIZE {
@@ -926,6 +942,21 @@ impl IndexManager {
                             );
                         }
                         if let Ok(resp) = serde_json::from_str::<BatchUploadResponse>(&body_text) {
+                            if !resp.skipped_blobs.is_empty() {
+                                // Not fatal, but worth surfacing: anything the server skips is
+                                // absent from its index, so sending its hash in `added_blobs`
+                                // later would fail the whole retrieval request.
+                                warn!(
+                                    "Server skipped {} blob(s), they will not be indexed: {}",
+                                    resp.skipped_blobs.len(),
+                                    resp.skipped_blobs
+                                        .iter()
+                                        .take(5)
+                                        .cloned()
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                );
+                            }
                             return BatchUploadResult {
                                 blob_names: resp.blob_names,
                                 latency_ms: total_latency_ms,
@@ -1450,6 +1481,21 @@ fn process_file_standalone(
         return None;
     }
 
+    // Skip empty files.
+    //
+    // An empty file yields no retrievable content, and the server rejects empty blobs:
+    // `POST /batch-upload` puts them in `skipped_blobs` and does NOT return a blob name,
+    // i.e. they never enter the index. If we still record them in `FileEntry::blob_hashes`,
+    // the next `search_context` sends those hashes in `added_blobs` and the server fails the
+    // WHOLE request with `400 unknown blobs`. Python projects are hit hardest (one empty
+    // `__init__.py` per package: 183 of them in the FastAPI tree).
+    //
+    // Placed before the cache check on purpose, so stale entries from older index files
+    // are dropped as well, not just freshly scanned files.
+    if metadata.len() == 0 {
+        return None;
+    }
+
     let mtime = match metadata.modified() {
         Ok(t) => t,
         Err(_) => return preserve_old(),
@@ -1546,6 +1592,11 @@ fn process_file_standalone(
     }
 
     let clean_content = IndexManager::sanitize_content(&content);
+
+    // Whitespace-only files are empty for retrieval purposes too (see the note above).
+    if clean_content.trim().is_empty() {
+        return None;
+    }
 
     if clean_content.len() > MAX_BLOB_SIZE {
         return None;

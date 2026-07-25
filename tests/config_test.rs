@@ -26,9 +26,11 @@ fn test_config_adds_https_prefix() {
 }
 
 #[test]
-fn test_config_converts_http_to_https() {
+fn test_config_preserves_explicit_http() {
+    // Explicit http:// is kept as-is so a local plain-HTTP backend stays reachable
+    // (e.g. --base-url http://127.0.0.1:8000). Only scheme-less input gets https:// added.
     let config = test_config("http://api.example.com", "test-token").unwrap();
-    assert_eq!(config.base_url, "https://api.example.com");
+    assert_eq!(config.base_url, "http://api.example.com");
 }
 
 #[test]
