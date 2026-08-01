@@ -152,29 +152,12 @@ struct BatchUploadResult {
     success: bool,
 }
 
-/// Search request payload
-#[derive(Debug, Serialize)]
-struct SearchRequest {
-    information_request: String,
-    blobs: BlobsPayload,
-    dialog: Vec<serde_json::Value>,
-    max_output_length: i32,
-    disable_codebase_retrieval: bool,
-    enable_commit_retrieval: bool,
-}
-
-#[derive(Debug, Serialize)]
-struct BlobsPayload {
-    checkpoint_id: Option<String>,
-    added_blobs: Vec<String>,
-    deleted_blobs: Vec<String>,
-}
-
-/// Search response
-#[derive(Debug, Deserialize)]
-struct SearchResponse {
-    formatted_retrieval: Option<String>,
-}
+// Wire types for `POST /agents/codebase-retrieval` live in `wire_types.rs`
+// (SSOT with `ace-backend-rs/crates/ace-api/src/wire.rs`). `SearchRequest`
+// gained `supports_tiering: bool` and `SearchResponse` gained
+// `retrieval_tiers: Option<TierInfo>` as part of the client-side tiering
+// support (design.md §Data Models).
+use crate::index::wire_types::{BlobsPayload, SearchRequest, SearchResponse};
 
 /// Calculate configuration fingerprint for detecting index-affecting config changes
 ///
@@ -250,6 +233,31 @@ impl IndexManager {
             no_adaptive: config.no_adaptive,
             cli_overrides: config.cli_overrides.clone(),
         })
+    }
+
+    /// Compose the final response string from server-returned `formatted_retrieval`
+    /// plus optional local hint expansion.
+    ///
+    /// **Production wiring point** -- the tests in `tests/tiering_test.rs`
+    /// call this to guard against C1-style regressions (the wire-up quietly
+    /// dropping hint expansion). Keep this a real method on `IndexManager`
+    /// (not an inline closure inside `search_context`) precisely so tests
+    /// can drive it without the full HTTP + index roundtrip.
+    pub fn compose_with_tiers(
+        &self,
+        base: String,
+        tiers: Option<&crate::index::wire_types::TierInfo>,
+    ) -> String {
+        match tiers {
+            Some(t) if !t.hints.is_empty() => {
+                crate::index::tier_expand::append_expanded_hints(
+                    &base,
+                    t,
+                    &self.project_root,
+                )
+            }
+            _ => base,
+        }
     }
 
     /// Get the base URL
@@ -1325,6 +1333,12 @@ impl IndexManager {
             max_output_length: 0,
             disable_codebase_retrieval: false,
             enable_commit_retrieval: false,
+            // Tiering opt-in: we implement local hint expansion below, so we
+            // MUST declare capability. Sending `false` here while the client
+            // has an expander wired would (paradoxically) DEGRADE retrieval
+            // because the server would fall back to fewer full-text files
+            // instead of the mixed full+hint payload. See design R3-A1.
+            supports_tiering: true,
         };
 
         let request_id = generate_request_id();
@@ -1410,15 +1424,15 @@ impl IndexManager {
 
                 let search_response: SearchResponse = serde_json::from_str(&body_text)?;
 
-                match search_response.formatted_retrieval {
-                    Some(result) if !result.is_empty() => {
-                        info!("Search complete");
-                        Ok(result)
-                    }
-                    _ => {
-                        info!("No relevant code found");
-                        Ok("No relevant code context found for your query.".to_string())
-                    }
+                let base = search_response.formatted_retrieval.unwrap_or_default();
+                let combined = self.compose_with_tiers(base, search_response.retrieval_tiers.as_ref());
+
+                if combined.is_empty() {
+                    info!("No relevant code found");
+                    Ok("No relevant code context found for your query.".to_string())
+                } else {
+                    info!("Search complete");
+                    Ok(combined)
                 }
             }
             Err(e) => {
