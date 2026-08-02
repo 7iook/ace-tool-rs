@@ -275,6 +275,33 @@ impl IndexManager {
         &self.project_root
     }
 
+    /// Derive a stable per-project identifier for the `X-Ace-Project` header.
+    ///
+    /// Server contract (see `ace-backend-rs/crates/ace-api/src/project_scope.rs`):
+    /// header must match `^[0-9a-f]{32}$`. We compute `sha256(project_root)`
+    /// and take the first 32 hex chars — deterministic per absolute path,
+    /// safe across sessions/machines that share a canonical mount, and never
+    /// collides with SHA-256's full 64-hex form (server rejects legacy 64-hex).
+    ///
+    /// **Why send this**: the server's fallback path (no header) infers the
+    /// project from `added_blobs` intersection with existing projects. In a
+    /// tenant that has a "polluted" catch-all project owning blobs from many
+    /// repos, that inference silently routes queries into the wrong project
+    /// and leaks cross-project content back to the caller. Sending an
+    /// explicit `X-Ace-Project` bypasses inference entirely (spec R1: Explicit
+    /// scope, precision 100%).
+    ///
+    /// Uses the normalized absolute project root path (lowercased on Windows,
+    /// forward-slashed) so the same repo checked out at the same path across
+    /// sessions produces the same key.
+    pub fn project_key(&self) -> String {
+        let path_str = self.project_root.to_string_lossy();
+        let normalized = path_str.replace('\\', "/").to_lowercase();
+        let mut hasher = Sha256::new();
+        hasher.update(normalized.as_bytes());
+        hex::encode(&hasher.finalize()[..16]) // 16 bytes → 32 hex chars
+    }
+
     /// Get the runtime environment
     pub fn runtime_env(&self) -> RuntimeEnv {
         self.runtime_env
@@ -823,6 +850,16 @@ impl IndexManager {
             blobs: blobs.to_vec(),
         };
 
+        // Derive project_key locally to keep this function's signature stable
+        // (see IndexManager::project_key doc for algorithm + rationale).
+        let project_key = {
+            let path_str = project_root.to_string_lossy();
+            let normalized = path_str.replace('\\', "/").to_lowercase();
+            let mut hasher = Sha256::new();
+            hasher.update(normalized.as_bytes());
+            hex::encode(&hasher.finalize()[..16])
+        };
+
         let request_body = if http_logger::is_enabled() {
             serde_json::to_string(&request).ok()
         } else {
@@ -861,6 +898,10 @@ impl IndexManager {
                 .header("User-Agent", USER_AGENT)
                 .header("x-request-id", &request_id)
                 .header("x-request-session-id", get_session_id())
+                // §Anti-pollution: send explicit X-Ace-Project so the server
+                // routes writes to the caller's specific project instead of
+                // whatever the fallback "blob intersection" happens to match.
+                .header("X-Ace-Project", &project_key)
                 .header("Authorization", format!("Bearer {}", token))
                 .json(&request)
                 .send()
@@ -1371,6 +1412,11 @@ impl IndexManager {
             .header("User-Agent", USER_AGENT)
             .header("x-request-id", &request_id)
             .header("x-request-session-id", get_session_id())
+            // §Anti-pollution: send explicit project scope to bypass the
+            // server's fallback "blob intersection" inference, which can
+            // silently route to the wrong project when a polluted catch-all
+            // exists in the same tenant (see project_key doc).
+            .header("X-Ace-Project", self.project_key())
             .header("Authorization", format!("Bearer {}", self.token))
             .json(&request)
             .send()
