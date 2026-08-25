@@ -1,11 +1,11 @@
 {
-  "name": "@ace-tool-rs/linux-x64",
+  "name": "@7iook/ace-tool-rs-linux-x64",
   "version": "0.1.16",
-  "description": "Platform-specific binary for ace-tool-rs (Linux x64)",
+  "description": "Platform-specific binary for @7iook/ace-tool-rs (Linux x64)",
   "license": "GPL-3.0-only OR LicenseRef-Commercial",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/missdeer/ace-tool-rs.git"
+    "url": "git+https://github.com/7iook/ace-tool-rs.git"
   },
   "os": ["linux"],
   "cpu": ["x64"],

@@ -1,11 +1,11 @@
 {
-  "name": "@ace-tool-rs/darwin-universal",
+  "name": "@7iook/ace-tool-rs-darwin-universal",
   "version": "0.1.16",
-  "description": "Platform-specific binary for ace-tool-rs (macOS Universal)",
+  "description": "Platform-specific binary for @7iook/ace-tool-rs (macOS Universal)",
   "license": "GPL-3.0-only OR LicenseRef-Commercial",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/missdeer/ace-tool-rs.git"
+    "url": "git+https://github.com/7iook/ace-tool-rs.git"
   },
   "os": ["darwin"],
   "cpu": ["x64", "arm64"],

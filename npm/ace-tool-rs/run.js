@@ -5,12 +5,12 @@ const path = require("path");
 const os = require("os");
 
 const PLATFORMS = {
-  "darwin-x64": "@ace-tool-rs/darwin-universal",
-  "darwin-arm64": "@ace-tool-rs/darwin-universal",
-  "linux-x64": "@ace-tool-rs/linux-x64",
-  "linux-arm64": "@ace-tool-rs/linux-arm64",
-  "win32-x64": "@ace-tool-rs/win32-x64",
-  "win32-arm64": "@ace-tool-rs/win32-arm64",
+  "darwin-x64": "@7iook/ace-tool-rs-darwin-universal",
+  "darwin-arm64": "@7iook/ace-tool-rs-darwin-universal",
+  "linux-x64": "@7iook/ace-tool-rs-linux-x64",
+  "linux-arm64": "@7iook/ace-tool-rs-linux-arm64",
+  "win32-x64": "@7iook/ace-tool-rs-win32-x64",
+  "win32-arm64": "@7iook/ace-tool-rs-win32-arm64",
 };
 
 function getBinaryPath() {
@@ -32,7 +32,7 @@ function getBinaryPath() {
     console.error("This may happen if npm failed to install the optional dependency.");
     console.error("");
     console.error("Try reinstalling:");
-    console.error("  npm install ace-tool-rs");
+    console.error("  npm install @7iook/ace-tool-rs");
     console.error("");
     console.error("Or install the platform package directly:");
     console.error(`  npm install ${pkgName}`);
