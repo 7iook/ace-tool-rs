@@ -200,7 +200,7 @@ jobs:
             artifacts/*.zip
             artifacts/SHA256SUMS
         env:
-          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   publish-npm-platforms:
     name: Publish ${{ matrix.platform }} to NPM
