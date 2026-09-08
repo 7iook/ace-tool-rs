@@ -604,3 +604,222 @@ async fn search_repair_evicts_the_whole_file_when_only_one_of_its_chunks_is_unkn
          server named -- otherwise the file stays half-indexed"
     );
 }
+
+// ============================================================================
+// Honest-status regression tests (raised by independent review, 2026-09-08)
+// ============================================================================
+
+/// Scenario: the server answers `200 OK` but its `blob_names` omits some of
+/// the blobs it was sent -- a perfectly valid HTTP exchange in which the
+/// index nonetheless ends up incomplete, because reconciliation drops the
+/// unconfirmed files. Reporting `success` there would tell the caller (and
+/// `--index-only`'s exit code) that a corpus is complete when it is not.
+#[tokio::test]
+async fn a_200_response_that_confirms_only_some_blobs_is_reported_as_partial_not_success() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/batch-upload"))
+        .respond_with(|req: &Request| {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+            let blobs = body["blobs"].as_array().cloned().unwrap_or_default();
+            let confirmed: Vec<String> = blobs
+                .iter()
+                .filter(|b| b["path"].as_str() == Some("keep.txt"))
+                .map(|b| {
+                    let p = b["path"].as_str().unwrap();
+                    let c = b["content"].as_str().unwrap();
+                    IndexManager::calculate_blob_name(p, c)
+                })
+                .collect();
+            ResponseTemplate::new(200).set_body_json(json!({
+                "blob_names": confirmed,
+                "skipped_blobs": [],
+            }))
+        })
+        .mount(&mock_server)
+        .await;
+
+    let temp_dir = TempDir::new().unwrap();
+    fs::write(temp_dir.path().join("keep.txt"), "keep me").unwrap();
+    fs::write(temp_dir.path().join("drop.txt"), "drop me").unwrap();
+
+    let config = Config::new(
+        mock_server.uri(),
+        "test-token".to_string(),
+        no_adaptive_options(),
+    )
+    .unwrap();
+    let manager = IndexManager::new(config, temp_dir.path().to_path_buf()).unwrap();
+
+    let result = manager.index_project().await;
+    assert_eq!(
+        result.status, "partial",
+        "every HTTP call succeeded, but one blob was never confirmed -- that is \
+         not a complete index and must not be reported as success: {}",
+        result.message
+    );
+    assert!(
+        result.message.contains("did not confirm"),
+        "the message must name the unconfirmed blobs, got: {}",
+        result.message
+    );
+}
+
+/// Scenario: the search repair evicts a file, but re-uploading it fails. The
+/// remaining index still has other (valid) entries, so a search would return
+/// a plausible-looking answer computed over a corpus that is knowingly
+/// missing the file we were trying to restore. That must surface as an error
+/// rather than a quietly degraded success.
+#[tokio::test]
+async fn repair_that_cannot_re_upload_reports_an_error_instead_of_a_degraded_result() {
+    let mock_server = MockServer::start().await;
+
+    let temp_dir = TempDir::new().unwrap();
+    fs::write(temp_dir.path().join("stays.txt"), "unrelated but indexed").unwrap();
+    fs::write(
+        temp_dir.path().join("lost.txt"),
+        "the blob the server forgot",
+    )
+    .unwrap();
+    let lost_hash = IndexManager::calculate_blob_name("lost.txt", "the blob the server forgot");
+
+    // First upload confirms everything; every later upload hard-fails, so the
+    // repair cannot restore lost.txt.
+    let upload_calls = Arc::new(AtomicUsize::new(0));
+    let upload_calls_for_mock = upload_calls.clone();
+    Mock::given(method("POST"))
+        .and(path("/batch-upload"))
+        .respond_with(move |req: &Request| {
+            if upload_calls_for_mock.fetch_add(1, Ordering::SeqCst) == 0 {
+                confirm_all_blobs_responder(req)
+            } else {
+                ResponseTemplate::new(500).set_body_string("upload backend down")
+            }
+        })
+        .mount(&mock_server)
+        .await;
+
+    // The retry itself would happily succeed -- the server is glad to answer
+    // using whatever blobs remain. Only the incompleteness of the repaired
+    // index can make this call fail, which is exactly what's under test.
+    let retrieval_call_count = Arc::new(AtomicUsize::new(0));
+    let retrieval_call_count_for_mock = retrieval_call_count.clone();
+    Mock::given(method("POST"))
+        .and(path("/agents/codebase-retrieval"))
+        .respond_with(move |_req: &Request| {
+            if retrieval_call_count_for_mock.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(400)
+                    .set_body_string(format!("Bad Request - unknown blobs: {}", lost_hash))
+            } else {
+                ResponseTemplate::new(200).set_body_json(
+                    json!({ "formatted_retrieval": "answer built without lost.txt" }),
+                )
+            }
+        })
+        .mount(&mock_server)
+        .await;
+
+    let config = Config::new(
+        mock_server.uri(),
+        "test-token".to_string(),
+        no_adaptive_options(),
+    )
+    .unwrap();
+    let manager = IndexManager::new(config, temp_dir.path().to_path_buf()).unwrap();
+
+    let result = manager.search_context("anything").await;
+    assert!(
+        result.is_err(),
+        "the retry would have returned a perfectly plausible answer computed \
+         without lost.txt; a repair that could not re-upload must surface as an \
+         error rather than that degraded result, got: {:?}",
+        result.ok()
+    );
+}
+
+/// Scenario: the server names the unknown blob in uppercase hex, and the same
+/// body also carries a longer hex token (a request id). The repair must still
+/// recognize the real hash, and must not evict anything on account of a
+/// 64-character slice taken out of the middle of the longer token.
+#[tokio::test]
+async fn unknown_blob_parsing_accepts_uppercase_and_ignores_longer_hex_tokens() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/batch-upload"))
+        .respond_with(confirm_all_blobs_responder)
+        .mount(&mock_server)
+        .await;
+
+    let temp_dir = TempDir::new().unwrap();
+    fs::write(temp_dir.path().join("a.txt"), "hello world").unwrap();
+    let real_hash = IndexManager::calculate_blob_name("a.txt", "hello world");
+    let shouty_hash = real_hash.to_ascii_uppercase();
+    // 72 hex chars: contains 64-char substrings, but is not itself a hash.
+    let long_hex_token = "a".repeat(72);
+
+    let retrieval_call_count = Arc::new(AtomicUsize::new(0));
+    let retrieval_call_count_for_mock = retrieval_call_count.clone();
+    let expected_after_repair = real_hash.clone();
+
+    Mock::given(method("POST"))
+        .and(path("/agents/codebase-retrieval"))
+        .respond_with(move |req: &Request| {
+            let call_index = retrieval_call_count_for_mock.fetch_add(1, Ordering::SeqCst);
+            if call_index == 0 {
+                return ResponseTemplate::new(400).set_body_string(format!(
+                    "Bad Request (request_id={}) - unknown blobs: {}",
+                    long_hex_token, shouty_hash
+                ));
+            }
+            // The retry must actually carry the re-uploaded blob, otherwise a
+            // mock that blindly succeeds would let a broken repair pass.
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+            let added: Vec<&str> = body["blobs"]["added_blobs"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            if added.contains(&expected_after_repair.as_str()) {
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "formatted_retrieval": "healed via uppercase hash" }))
+            } else {
+                ResponseTemplate::new(400).set_body_string("retry did not resend the repaired blob")
+            }
+        })
+        .mount(&mock_server)
+        .await;
+
+    let config = Config::new(
+        mock_server.uri(),
+        "test-token".to_string(),
+        no_adaptive_options(),
+    )
+    .unwrap();
+    let manager = IndexManager::new(config, temp_dir.path().to_path_buf()).unwrap();
+
+    let result = manager.search_context("find something").await;
+    assert!(
+        result.is_ok(),
+        "an uppercase hash names the same blob and must trigger the repair, got: {:?}",
+        result.err()
+    );
+    assert_eq!(result.unwrap(), "healed via uppercase hash");
+
+    // The load-bearing assertion: a.txt must actually have been evicted and
+    // re-uploaded. Without it the test would also pass when the parser missed
+    // the uppercase hash but matched a 64-char slice of the long request id --
+    // the retry would then resend the untouched index and still get a 200.
+    let upload_requests = mock_server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == "/batch-upload")
+        .count();
+    assert_eq!(
+        upload_requests, 2,
+        "the uppercase hash must have been recognized, evicting a.txt and \
+         re-uploading it (initial index + repair index)"
+    );
+}

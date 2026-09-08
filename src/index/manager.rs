@@ -1260,6 +1260,7 @@ impl IndexManager {
         // Step 5: Upload new blobs with adaptive strategy
         let mut uploaded_blob_names: Vec<String> = Vec::new();
         let mut failed_batch_count: usize = 0;
+        let attempted_new_blobs = new_blobs.len();
 
         if !new_blobs.is_empty() {
             let blobs_count = new_blobs.len();
@@ -1330,6 +1331,15 @@ impl IndexManager {
         );
 
         // Step 7: Determine result status
+        //
+        // A batch counts as "failed" only when the HTTP call itself failed, but a
+        // perfectly valid `200` can still confirm fewer blobs than it was sent (the
+        // server skipping some, or simply omitting them from `blob_names`). Those
+        // blobs were just dropped by the Step 5.5 reconciliation, so the index is
+        // incomplete even though `failed_batch_count == 0`. Reporting that as
+        // `success` would hand the caller a silently partial corpus -- and, via
+        // `--index-only`, a zero exit code.
+        let unconfirmed_new_blobs = attempted_new_blobs.saturating_sub(confirmed_new_count);
         let (status, message) = if save_failed {
             (
                 "error".to_string(),
@@ -1338,12 +1348,18 @@ impl IndexManager {
                     total_blobs, failed_batch_count
                 ),
             )
-        } else if failed_batch_count > 0 {
+        } else if failed_batch_count > 0 || unconfirmed_new_blobs > 0 {
             (
                 "partial".to_string(),
                 format!(
-                    "Indexed {} blobs with {} failed batches (cached: {}, new: {})",
-                    total_blobs, failed_batch_count, cached_count, confirmed_new_count
+                    "Indexed {} blobs with {} failed batches and {} blob(s) the server did not \
+                     confirm (cached: {}, new: {}); unconfirmed files stay out of the index and \
+                     are retried on the next run",
+                    total_blobs,
+                    failed_batch_count,
+                    unconfirmed_new_blobs,
+                    cached_count,
+                    confirmed_new_count
                 ),
             )
         } else {
@@ -1383,8 +1399,14 @@ impl IndexManager {
     /// (which now sees those files as new and re-uploads them), and retry the
     /// search exactly once. A second failure is surfaced as-is -- this function
     /// never swallows an error into an empty/successful result.
+    ///
+    /// The retry runs with `require_complete_index = true`: having just evicted
+    /// entries from the index, a rebuild that only partially succeeds would leave
+    /// the corpus missing exactly the files we were trying to restore. Searching
+    /// anyway would return a plausible-looking but incomplete answer with no
+    /// indication anything was lost, which is worse than reporting the failure.
     pub async fn search_context(&self, query: &str) -> Result<String> {
-        match self.search_context_once(query).await {
+        match self.search_context_once(query, false).await {
             Ok(result) => Ok(result),
             Err(SearchError::UnknownBlobs { hashes, source }) => {
                 warn!(
@@ -1400,7 +1422,7 @@ impl IndexManager {
                         e
                     ));
                 }
-                self.search_context_once(query).await.map_err(|e| {
+                self.search_context_once(query, true).await.map_err(|e| {
                     anyhow!(
                         "Search failed again after automatically rebuilding {} unknown blob(s) \
                          and retrying once (original error: {}): {}",
@@ -1444,7 +1466,16 @@ impl IndexManager {
     /// Single search attempt -- no retry logic. `search_context` is the only
     /// caller allowed to retry, and it does so exactly once via a plain `if`,
     /// not recursion, so there is no risk of unbounded retry loops.
-    async fn search_context_once(&self, query: &str) -> Result<String, SearchError> {
+    ///
+    /// `require_complete_index` promotes a `partial` indexing result to a hard
+    /// error. The repair attempt sets it, because searching a corpus we know is
+    /// still missing the very blobs we just evicted would dress up a failed
+    /// repair as a successful search.
+    async fn search_context_once(
+        &self,
+        query: &str,
+        require_complete_index: bool,
+    ) -> Result<String, SearchError> {
         info!("Starting search: {}", query);
 
         // Auto-index first
@@ -1452,6 +1483,13 @@ impl IndexManager {
         if index_result.status == "error" {
             return Err(SearchError::Other(anyhow!(
                 "Failed to index project: {}",
+                index_result.message
+            )));
+        }
+        if require_complete_index && index_result.status == "partial" {
+            return Err(SearchError::Other(anyhow!(
+                "Index repair did not complete, so the corpus is still missing blobs; \
+                 refusing to return a partial search result: {}",
                 index_result.message
             )));
         }
@@ -1650,10 +1688,10 @@ impl SearchError {
     }
 }
 
-/// Extract 64-character lowercase-hex SHA-256 hashes from a `400 unknown
-/// blobs` response body. Returns an empty vec if the body doesn't mention
-/// "unknown blobs" at all (callers must not retry in that case) or contains
-/// no well-formed hash-looking tokens.
+/// Extract 64-character hex SHA-256 hashes from a `400 unknown blobs`
+/// response body, normalized to lowercase. Returns an empty set if the body
+/// doesn't mention "unknown blobs" at all (callers must not retry in that
+/// case) or contains no well-formed hash tokens.
 fn parse_unknown_blob_hashes(body: &str) -> HashSet<String> {
     if !body.to_lowercase().contains("unknown blobs") {
         return HashSet::new();
@@ -1661,9 +1699,18 @@ fn parse_unknown_blob_hashes(body: &str) -> HashSet<String> {
 
     use std::sync::OnceLock;
     static HASH_RE: OnceLock<Regex> = OnceLock::new();
-    let re = HASH_RE.get_or_init(|| Regex::new(r"[0-9a-f]{64}").expect("valid regex literal"));
+    // Case-insensitive, and anchored so a 64-char run has to be the *whole* hex
+    // token: without the boundaries, a longer hex string elsewhere in the body
+    // (a request id, a truncated payload) would donate an arbitrary 64-char
+    // substring and get evicted from the index as if the server had named it.
+    let re =
+        HASH_RE.get_or_init(|| Regex::new(r"(?i)\b[0-9a-f]{64}\b").expect("valid regex literal"));
 
-    re.find_iter(body).map(|m| m.as_str().to_string()).collect()
+    // Hashes are stored lowercase (`hex::encode`), so normalize before matching
+    // against index entries -- an uppercase hash in the response must still hit.
+    re.find_iter(body)
+        .map(|m| m.as_str().to_ascii_lowercase())
+        .collect()
 }
 
 /// Standalone file processing function for use in parallel context

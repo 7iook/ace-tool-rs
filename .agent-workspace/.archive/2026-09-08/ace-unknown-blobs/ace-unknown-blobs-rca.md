@@ -224,3 +224,37 @@ local index file, sync blobs before search`)+ `Select-String config_hash` 全仓
 
   验收:`cargo fmt --check` 0 差异 · `cargo clippy --all-targets --all-features -- -D warnings`
   零警告 · `cargo test` 全绿(新增 `tests/backend_resync_test.rs` 7 个用例:F1×2 / F2×4 / F3×1)。
+
+- 2026-09-08 23:40 · 异构 reviewer(gpt-5.6-sol)独立审查判 CHANGES_REQUESTED,带可复现实验。
+  三条采纳并修复,全部先红后绿:
+
+  1. **修复重传失败仍返回成功(高)**。F2 剔除 entry 后若重传失败,只要索引里还剩其他 cached
+     entry,第二次检索就会用残缺语料返回 `Ok`。这直接违反本 RCA §1 成功态的负条件。
+     修法:`search_context_once` 增加 `require_complete_index` 参数,**仅修复重试路径**置 true,
+     此时 `index_project` 返回 `partial` 直接判错。首次尝试维持原有 warn-then-continue
+     行为(那是既有语义,不在本次根因半径内)。
+  2. **HTTP 200 的部分回执被报成 success(高)**。`failed_batch_count` 只反映 HTTP 层失败;
+     服务端合法 200 但 `blob_names` 少回时,F1 已把这些文件剔出索引,状态却仍是 `success`、
+     `--index-only` 退出码 0。修法:新增 `unconfirmed_new_blobs = 尝试数 - 确认数`,
+     大于 0 即判 `partial`,message 里点名未确认数量。
+  3. **hash 解析大小写不一致 + 无 hex 边界(中)**。`unknown blobs` 用大小写不敏感判断,
+     hash 正则却只收小写,大写 SHA-256 不触发自愈;且无边界会从更长 hex(如 request id)
+     里截 64 位子串导致误剔除。修法:`(?i)\b[0-9a-f]{64}\b` + 统一转小写。
+
+  **两个新用例最初"因错误的原因通过",已按 reviewer 意见收紧**:
+  ① `repair_that_cannot_re_upload...` 原本让检索 mock 每次都回 400,那样没有 partial 守卫
+  也会失败;改成第二次检索**返回成功**,使成败只由守卫决定。
+  ② `unknown_blob_parsing...` 原本只断言最终成功,但旧正则会从 72 个 `a` 里截出假 hash 从而
+  照样触发重试;补上"必须发生第二次 `/batch-upload`"的断言。
+  收紧后在撤回修复的状态下 3 个用例全红,失败形态分别为 `"success"` vs `"partial"`、
+  重传次数 `1` vs `2`、降级结果未报错。
+
+  **未采纳(登记为已知限制)**:reviewer 提出的同项目并发(MCP 常驻进程与 CLI 同时写索引)
+  丢更新问题。`save_index` 的"读快照→改→覆盖写"与共享 tmp 文件是**既有**模式,
+  不是本次引入;修它需要文件锁,超出本次根因半径(§5.5)。影响是可恢复的缓存损坏
+  (最坏情况退化成再跑一次自愈),不会造成数据丢失。已在此登记,后续单独处理。
+
+  改动后重跑两条真实 e2e,行为不变:F3 切回 A 仍是 `2 cached, 0 new`;
+  F2 仍走通 `400 → Invalidated → 重传 → Search complete`,结果命中 marker。
+  验收:fmt 0 差异 · clippy `--all-features -D warnings` 零警告 ·
+  `cargo test` 全绿(`backend_resync_test` 10 个用例)。
