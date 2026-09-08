@@ -334,7 +334,8 @@ impl PromptEnhancer {
 
     /// Load blob names from index file
     fn load_blob_names(&self, project_root: &Path) -> Vec<String> {
-        let index_file_path = get_index_file_path(project_root);
+        let index_file_path =
+            get_index_file_path(project_root, &self.config.base_url, &self.config.token);
 
         if !index_file_path.exists() {
             return Vec::new();

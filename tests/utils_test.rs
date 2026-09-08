@@ -119,12 +119,17 @@ fn test_get_ace_dir_handles_gitignore_without_trailing_newline() {
 #[test]
 fn test_get_index_file_path() {
     let temp_dir = TempDir::new().unwrap();
-    let index_path = get_index_file_path(temp_dir.path());
+    let index_path = get_index_file_path(temp_dir.path(), "https://api.example.com", "token-a");
 
+    // Per-backend filename: index-<fp>.bin, still inside .ace-tool/
     assert_eq!(
-        index_path,
-        temp_dir.path().join(".ace-tool").join("index.bin")
+        index_path.parent().unwrap(),
+        temp_dir.path().join(".ace-tool")
     );
+    let filename = index_path.file_name().unwrap().to_str().unwrap();
+    assert!(filename.starts_with("index-"));
+    assert!(filename.ends_with(".bin"));
+    assert_ne!(filename, "index.bin");
     // The .ace-tool directory should have been created
     assert!(temp_dir.path().join(".ace-tool").exists());
 }
@@ -133,8 +138,40 @@ fn test_get_index_file_path() {
 fn test_get_index_file_path_consistent() {
     let temp_dir = TempDir::new().unwrap();
 
-    let path1 = get_index_file_path(temp_dir.path());
-    let path2 = get_index_file_path(temp_dir.path());
+    let path1 = get_index_file_path(temp_dir.path(), "https://api.example.com", "token-a");
+    let path2 = get_index_file_path(temp_dir.path(), "https://api.example.com", "token-a");
 
     assert_eq!(path1, path2);
+}
+
+#[test]
+fn test_get_index_file_path_differs_per_backend() {
+    let temp_dir = TempDir::new().unwrap();
+
+    let path_a = get_index_file_path(temp_dir.path(), "https://backend-a.example.com", "token");
+    let path_b = get_index_file_path(temp_dir.path(), "https://backend-b.example.com", "token");
+    let path_c = get_index_file_path(
+        temp_dir.path(),
+        "https://backend-a.example.com",
+        "other-token",
+    );
+
+    assert_ne!(path_a, path_b);
+    assert_ne!(path_a, path_c);
+}
+
+#[test]
+fn test_get_index_file_path_leaves_legacy_index_bin_untouched() {
+    let temp_dir = TempDir::new().unwrap();
+    let ace_dir = get_ace_dir(temp_dir.path());
+    let legacy_path = ace_dir.join("index.bin");
+    fs::write(&legacy_path, b"legacy data").unwrap();
+
+    let new_path = get_index_file_path(temp_dir.path(), "https://api.example.com", "token-a");
+
+    // The new per-backend path must not be the legacy path, and the legacy
+    // file must be left alone (not read, not deleted).
+    assert_ne!(new_path, legacy_path);
+    assert!(legacy_path.exists());
+    assert_eq!(fs::read(&legacy_path).unwrap(), b"legacy data");
 }

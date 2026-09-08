@@ -199,7 +199,7 @@ impl IndexManager {
         let normalized = normalize_path(&project_root, runtime_env);
         let project_root = normalized.local;
 
-        let index_file_path = get_index_file_path(&project_root);
+        let index_file_path = get_index_file_path(&project_root, &config.base_url, &config.token);
 
         // Precompile exclude patterns to regex
         let compiled_patterns: Vec<(String, Option<Regex>)> = config
@@ -250,11 +250,7 @@ impl IndexManager {
     ) -> String {
         match tiers {
             Some(t) if !t.hints.is_empty() => {
-                crate::index::tier_expand::append_expanded_hints(
-                    &base,
-                    t,
-                    &self.project_root,
-                )
+                crate::index::tier_expand::append_expanded_hints(&base, t, &self.project_root)
             }
             _ => base,
         }
@@ -310,6 +306,11 @@ impl IndexManager {
     /// Get the config hash
     pub fn config_hash(&self) -> &str {
         &self.config_hash
+    }
+
+    /// Get the on-disk index file path (per-backend, see `get_index_file_path`)
+    pub fn index_file_path(&self) -> &Path {
+        &self.index_file_path
     }
 
     /// Check if a path should be excluded
@@ -1229,6 +1230,13 @@ impl IndexManager {
 
         let mut cached_count = 0usize;
         let mut new_blobs: Vec<Blob> = Vec::new();
+        // Entries from `ProcessedResult::New` are NOT inserted into `new_index` yet:
+        // we don't know if the server will actually accept their blobs until after
+        // Step 5 uploads them. Inserting eagerly (the old behavior) is exactly what
+        // let a failed/partial upload masquerade as "indexed" forever (see F1 in
+        // ace-unknown-blobs-rca.md). They're reconciled against the upload receipt
+        // below and only then merged in.
+        let mut pending_new_entries: Vec<(String, FileEntry)> = Vec::new();
 
         for pf in results {
             match pf.result {
@@ -1237,8 +1245,8 @@ impl IndexManager {
                     new_index.entries.insert(pf.rel_path, entry);
                 }
                 ProcessedResult::New { blobs, entry } => {
-                    new_index.entries.insert(pf.rel_path, entry);
                     new_blobs.extend(blobs);
+                    pending_new_entries.push((pf.rel_path, entry));
                 }
             }
         }
@@ -1273,8 +1281,41 @@ impl IndexManager {
             info!("No new files to upload, using cached index");
         }
 
+        // Step 5.5: Reconcile against the upload receipt (F1 -- see
+        // ace-unknown-blobs-rca.md). `uploaded_blob_names` is the set of blob
+        // hashes the server itself confirmed (via `blob_names` in the
+        // `/batch-upload` response); anything skipped by the server or lost to a
+        // failed batch is absent from it. Only confirmed hashes are allowed into
+        // `new_index`. An entry that loses all its hashes is dropped entirely --
+        // on the next `index_project()` call it won't be found in `old_index`,
+        // so `process_file_standalone` naturally re-classifies it as `New` and
+        // retries the upload. This is the self-healing path: no extra "dirty"
+        // flag is needed.
+        let confirmed_blobs: HashSet<String> = uploaded_blob_names.into_iter().collect();
+        let mut confirmed_new_count = 0usize;
+        for (rel_path, entry) in pending_new_entries {
+            // All-or-nothing per file. A file over `max_lines_per_blob` lines is split
+            // into several chunks that can straddle a batch boundary, so a single failed
+            // batch can confirm some of its blobs and lose others. Keeping the confirmed
+            // subset would be worse than dropping the entry: the mtime cache treats any
+            // surviving entry as complete, so the missing chunks would never be re-uploaded,
+            // and retrieval would silently return a half-indexed file instead of failing
+            // loudly. Dropping the whole entry re-classifies the file as `New` next round.
+            if !entry
+                .blob_hashes
+                .iter()
+                .all(|h| confirmed_blobs.contains(h))
+            {
+                continue;
+            }
+            confirmed_new_count += entry.blob_hashes.len();
+            new_index.entries.insert(rel_path, entry);
+        }
+
         // Step 6: Save new index (atomic write)
-        let total_blobs = cached_count + uploaded_blob_names.len();
+        // Reflects the blobs actually landing in `new_index` after reconciliation,
+        // not merely how many the client attempted to upload.
+        let total_blobs = cached_count + confirmed_new_count;
         let save_failed = if let Err(e) = self.save_index(&new_index) {
             error!("Failed to save index: {}", e);
             true
@@ -1302,10 +1343,7 @@ impl IndexManager {
                 "partial".to_string(),
                 format!(
                     "Indexed {} blobs with {} failed batches (cached: {}, new: {})",
-                    total_blobs,
-                    failed_batch_count,
-                    cached_count,
-                    uploaded_blob_names.len()
+                    total_blobs, failed_batch_count, cached_count, confirmed_new_count
                 ),
             )
         } else {
@@ -1313,9 +1351,7 @@ impl IndexManager {
                 "success".to_string(),
                 format!(
                     "Indexed {} blobs (cached: {}, new: {})",
-                    total_blobs,
-                    cached_count,
-                    uploaded_blob_names.len()
+                    total_blobs, cached_count, confirmed_new_count
                 ),
             )
         };
@@ -1326,7 +1362,7 @@ impl IndexManager {
             stats: Some(IndexStats {
                 total_blobs,
                 existing_blobs: cached_count,
-                new_blobs: uploaded_blob_names.len(),
+                new_blobs: confirmed_new_count,
                 failed_batches: if failed_batch_count > 0 {
                     Some(failed_batch_count)
                 } else {
@@ -1336,14 +1372,88 @@ impl IndexManager {
         }
     }
 
-    /// Search code context
+    /// Search code context.
+    ///
+    /// F2 self-heal (see `ace-unknown-blobs-rca.md`): if the server rejects the
+    /// request with `400` + `unknown blobs: <hash...>`, the local index believes
+    /// blobs are present on the server that in fact are not (server-side GC,
+    /// retention expiry, or a switched backend/tenant). Rather than surfacing a
+    /// permanent, unrecoverable error, we parse the unknown hashes out of the
+    /// response body, drop them from the local index, re-run `index_project()`
+    /// (which now sees those files as new and re-uploads them), and retry the
+    /// search exactly once. A second failure is surfaced as-is -- this function
+    /// never swallows an error into an empty/successful result.
     pub async fn search_context(&self, query: &str) -> Result<String> {
+        match self.search_context_once(query).await {
+            Ok(result) => Ok(result),
+            Err(SearchError::UnknownBlobs { hashes, source }) => {
+                warn!(
+                    "Search rejected {} unknown blob hash(es); invalidating local index and \
+                     retrying once: {}",
+                    hashes.len(),
+                    source
+                );
+                if let Err(e) = self.invalidate_blobs(&hashes) {
+                    return Err(anyhow!(
+                        "Search failed ({}), and automatic index repair also failed: {}",
+                        source,
+                        e
+                    ));
+                }
+                self.search_context_once(query).await.map_err(|e| {
+                    anyhow!(
+                        "Search failed again after automatically rebuilding {} unknown blob(s) \
+                         and retrying once (original error: {}): {}",
+                        hashes.len(),
+                        source,
+                        e.into_anyhow()
+                    )
+                })
+            }
+            Err(SearchError::Other(e)) => Err(e),
+        }
+    }
+
+    /// Remove blob hashes the server no longer recognizes from the local index.
+    ///
+    /// Any `FileEntry` that loses all of its hashes is dropped entirely, which
+    /// makes the owning file invisible to the mtime cache on the next
+    /// `index_project()` call -- it is then read from disk again and its blobs
+    /// re-uploaded. This is the same self-healing mechanism as F1's upload
+    /// reconciliation, triggered here from the retrieval side instead.
+    fn invalidate_blobs(&self, hashes: &HashSet<String>) -> Result<()> {
+        let mut index = self.load_index();
+        let entries_before = index.entries.len();
+        // All-or-nothing, for the same reason as the upload reconciliation above: if any
+        // one chunk of a multi-chunk file is unknown to the server, the whole file has to
+        // be re-processed. Stripping just the unknown hash would leave a partial entry that
+        // the mtime cache accepts as complete, permanently hiding the missing chunk.
+        index
+            .entries
+            .retain(|_, entry| !entry.blob_hashes.iter().any(|h| hashes.contains(h)));
+        let entries_removed = entries_before - index.entries.len();
+        info!(
+            "Invalidated {} unknown blob hash(es), dropping {} stale index entr{}",
+            hashes.len(),
+            entries_removed,
+            if entries_removed == 1 { "y" } else { "ies" }
+        );
+        self.save_index(&index)
+    }
+
+    /// Single search attempt -- no retry logic. `search_context` is the only
+    /// caller allowed to retry, and it does so exactly once via a plain `if`,
+    /// not recursion, so there is no risk of unbounded retry loops.
+    async fn search_context_once(&self, query: &str) -> Result<String, SearchError> {
         info!("Starting search: {}", query);
 
         // Auto-index first
         let index_result = self.index_project().await;
         if index_result.status == "error" {
-            return Err(anyhow!("Failed to index project: {}", index_result.message));
+            return Err(SearchError::Other(anyhow!(
+                "Failed to index project: {}",
+                index_result.message
+            )));
         }
         if index_result.status == "partial" {
             warn!(
@@ -1356,7 +1466,7 @@ impl IndexManager {
         let index_data = self.load_index();
         let blob_names = index_data.get_all_blob_hashes();
         if blob_names.is_empty() {
-            return Err(anyhow!("No blobs found after indexing"));
+            return Err(SearchError::Other(anyhow!("No blobs found after indexing")));
         }
 
         // Execute search
@@ -1449,7 +1559,15 @@ impl IndexManager {
                             Some(&format!("Search failed: {} - {}", status, text)),
                         );
                     }
-                    return Err(anyhow!("Search failed: {} - {}", status, text));
+
+                    let source = anyhow!("Search failed: {} - {}", status, text);
+                    if status.as_u16() == 400 {
+                        let hashes = parse_unknown_blob_hashes(&text);
+                        if !hashes.is_empty() {
+                            return Err(SearchError::UnknownBlobs { hashes, source });
+                        }
+                    }
+                    return Err(SearchError::Other(source));
                 }
 
                 let body_text = resp.text().await.unwrap_or_default();
@@ -1468,10 +1586,14 @@ impl IndexManager {
                     );
                 }
 
-                let search_response: SearchResponse = serde_json::from_str(&body_text)?;
+                let search_response: SearchResponse =
+                    serde_json::from_str(&body_text).map_err(|e| {
+                        SearchError::Other(anyhow!("Failed to parse search response: {}", e))
+                    })?;
 
                 let base = search_response.formatted_retrieval.unwrap_or_default();
-                let combined = self.compose_with_tiers(base, search_response.retrieval_tiers.as_ref());
+                let combined =
+                    self.compose_with_tiers(base, search_response.retrieval_tiers.as_ref());
 
                 if combined.is_empty() {
                     info!("No relevant code found");
@@ -1492,10 +1614,56 @@ impl IndexManager {
                         Some(&error_msg),
                     );
                 }
-                Err(anyhow!("Search request failed: {}", error_msg))
+                Err(SearchError::Other(anyhow!(
+                    "Search request failed: {}",
+                    error_msg
+                )))
             }
         }
     }
+}
+
+/// Error from a single `search_context_once` attempt.
+///
+/// `UnknownBlobs` is a distinct variant (not just a string match on the final
+/// message) so `search_context`'s retry decision is driven by the actual
+/// parsed hash list, not by re-parsing a formatted error string.
+enum SearchError {
+    /// Server returned `400` and the body named specific blob hashes it does
+    /// not know about. Carries the parsed hashes plus the original error for
+    /// logging/final-message purposes.
+    UnknownBlobs {
+        hashes: HashSet<String>,
+        source: anyhow::Error,
+    },
+    /// Any other failure (non-400 HTTP error, network error, JSON parse
+    /// error, indexing failure, empty index, ...).
+    Other(anyhow::Error),
+}
+
+impl SearchError {
+    fn into_anyhow(self) -> anyhow::Error {
+        match self {
+            SearchError::UnknownBlobs { source, .. } => source,
+            SearchError::Other(e) => e,
+        }
+    }
+}
+
+/// Extract 64-character lowercase-hex SHA-256 hashes from a `400 unknown
+/// blobs` response body. Returns an empty vec if the body doesn't mention
+/// "unknown blobs" at all (callers must not retry in that case) or contains
+/// no well-formed hash-looking tokens.
+fn parse_unknown_blob_hashes(body: &str) -> HashSet<String> {
+    if !body.to_lowercase().contains("unknown blobs") {
+        return HashSet::new();
+    }
+
+    use std::sync::OnceLock;
+    static HASH_RE: OnceLock<Regex> = OnceLock::new();
+    let re = HASH_RE.get_or_init(|| Regex::new(r"[0-9a-f]{64}").expect("valid regex literal"));
+
+    re.find_iter(body).map(|m| m.as_str().to_string()).collect()
 }
 
 /// Standalone file processing function for use in parallel context

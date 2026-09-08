@@ -518,8 +518,8 @@ fn test_load_index_corrupted_data_returns_empty() {
     // Write corrupted bincode data
     let ace_dir = temp_dir.path().join(".ace-tool");
     fs::create_dir_all(&ace_dir).unwrap();
-    let index_path = ace_dir.join("index.bin");
-    fs::write(&index_path, b"invalid bincode data").unwrap();
+    let index_path = manager.index_file_path();
+    fs::write(index_path, b"invalid bincode data").unwrap();
 
     // Load should return empty index
     let loaded = manager.load_index();
@@ -553,8 +553,7 @@ fn test_save_index_creates_file() {
 
     manager.save_index(&index_data).unwrap();
 
-    let index_path = temp_dir.path().join(".ace-tool").join("index.bin");
-    assert!(index_path.exists());
+    assert!(manager.index_file_path().exists());
 }
 
 #[test]
@@ -616,8 +615,7 @@ fn test_save_index_no_temp_file_left() {
     manager.save_index(&index_data).unwrap();
 
     // Check no .tmp file exists
-    let ace_dir = temp_dir.path().join(".ace-tool");
-    let tmp_path = ace_dir.join("index.bin.tmp");
+    let tmp_path = manager.index_file_path().with_extension("bin.tmp");
     assert!(!tmp_path.exists());
 }
 
