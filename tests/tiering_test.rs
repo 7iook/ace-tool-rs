@@ -16,7 +16,9 @@
 //! real HTTP mock; no assertions on mocks themselves.
 
 use ace_tool::index::tier_expand::{expand_hint, HintExpandError};
-use ace_tool::index::wire_types::{HintEntry, SearchRequest, SearchResponse, TierInfo, BlobsPayload};
+use ace_tool::index::wire_types::{
+    BlobsPayload, HintEntry, SearchRequest, SearchResponse, TierInfo,
+};
 use ace_tool::index::IndexManager;
 use serde_json::json;
 use std::fs;
@@ -61,7 +63,8 @@ fn search_response_deserializes_without_retrieval_tiers_field() {
     // with Rust's r#""# delimiter grammar when the JSON payload itself
     // contains a `#` character.
     let body = json!({"formatted_retrieval": "# results"}).to_string();
-    let resp: SearchResponse = serde_json::from_str(&body).expect("must deserialize old-server body");
+    let resp: SearchResponse =
+        serde_json::from_str(&body).expect("must deserialize old-server body");
     assert_eq!(resp.formatted_retrieval.as_deref(), Some("# results"));
     assert!(
         resp.retrieval_tiers.is_none(),
@@ -90,7 +93,8 @@ fn search_response_deserializes_with_retrieval_tiers_populated() {
         }
     })
     .to_string();
-    let resp: SearchResponse = serde_json::from_str(&body).expect("new-server body must deserialize");
+    let resp: SearchResponse =
+        serde_json::from_str(&body).expect("new-server body must deserialize");
     let tiers = resp.retrieval_tiers.expect("retrieval_tiers must be Some");
     assert_eq!(tiers.full, vec!["src/lib.rs", "src/main.rs"]);
     assert_eq!(tiers.hints.len(), 1);
@@ -185,12 +189,24 @@ fn hint_expand_returns_version_mismatch_when_content_changed() {
     let rel = "src/util.rs";
     fs::create_dir_all(dir.path().join("src")).unwrap();
     fs::write(dir.path().join(rel), "current content\n").unwrap();
-    let hint = hint_for(rel, 1, 1, "0000000000000000000000000000000000000000000000000000000000000000");
+    let hint = hint_for(
+        rel,
+        1,
+        1,
+        "0000000000000000000000000000000000000000000000000000000000000000",
+    );
 
     match expand_hint(dir.path(), &hint) {
-        Err(HintExpandError::VersionMismatch { path, expected, actual }) => {
+        Err(HintExpandError::VersionMismatch {
+            path,
+            expected,
+            actual,
+        }) => {
             assert_eq!(path, rel);
-            assert_eq!(expected, "0000000000000000000000000000000000000000000000000000000000000000");
+            assert_eq!(
+                expected,
+                "0000000000000000000000000000000000000000000000000000000000000000"
+            );
             assert_ne!(actual, expected, "actual hash must differ from expected");
             assert_eq!(actual.len(), 64, "actual must be sha256 hex");
         }
