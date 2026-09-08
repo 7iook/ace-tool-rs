@@ -258,3 +258,19 @@ local index file, sync blobs before search`)+ `Select-String config_hash` 全仓
   F2 仍走通 `400 → Invalidated → 重传 → Search complete`,结果命中 marker。
   验收:fmt 0 差异 · clippy `--all-features -D warnings` 零警告 ·
   `cargo test` 全绿(`backend_resync_test` 10 个用例)。
+
+- 2026-09-08 23:55 · 已发布 v0.1.18 到 `@7iook/ace-tool-rs`。
+  CI 除 Security Audit 外全绿(Test Suite ubuntu stable/beta/nightly + macOS、Linting、
+  Min Rust Version 均通过);Security Audit 是 `cargo audit` 报的 6 个**既有依赖**漏洞,
+  本次 `Cargo.toml`/`Cargo.lock` 只改了版本号、依赖零增减,故与本次改动无关。
+  tag 流水线 5 个平台构建 + 6 个 npm 发布任务全部成功。
+
+  **发布后运维坑(值得记住,每次发版都会踩)**:npm registry 已经是 `latest: 0.1.18` 时,
+  本机 npm 的**元数据缓存**仍可能只知道旧版本,此时 `npx -y pkg@新版本` 直接报
+  `ETARGET No matching version found`。用户把 mcphub 切到 0.1.18 时正好撞上这个窗口,
+  npx 立即退出 → mcphub 判定 MCP 掉线,看起来像"新版本有回归"。
+  排除方法:`npm view <pkg> version --prefer-online` 刷新元数据后重试。
+  已实测排除回归:刷新后用 mcphub 完全相同的命令行启动 0.1.17 与 0.1.18,
+  两者 `initialize` 均 1.8s 成功、`tools/list` 均返回 `['search_context','enhance_prompt']`、
+  退出码 0;npx 跑 0.1.18 `--index-only` 生成 `index-e008451474ec9c26.bin`,
+  即发布产物确实带 F3。
